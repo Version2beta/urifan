@@ -1,0 +1,104 @@
+name: CI and binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  GOWORK: 'off'
+  GOPROXY: 'off'
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    name: Test ${{ matrix.os }} / Go ${{ matrix.go }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ['1.24.7', stable]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+      - name: Race tests
+        run: go test -race -count=1 -timeout 90s ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build and exercise the actual CLI
+        run: |
+          mkdir -p bin
+          go build -o bin/urifan ./cmd/urifan
+          python3 scripts/smoke.py bin/urifan
+
+  binaries:
+    name: Build Linux and macOS binaries
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Package all architectures
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="snapshot-${GITHUB_SHA:0:12}"
+          if [[ "$REF_TYPE" == tag ]]; then version="$REF_NAME"; fi
+          bash scripts/package.sh "$version"
+          (cd dist && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: urifan-binaries
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish experimental release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: urifan-binaries
+          path: dist
+      - name: Publish verified archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          gh release create "$RELEASE_TAG" dist/* \
+            --verify-tag --draft --prerelease --title "urifan $RELEASE_TAG (experimental)" \
+            --notes "Experimental URI fan-out library and CLI. Linux and macOS, amd64 and arm64. Extract the matching archive and run ./urifan --help. SHA256SUMS verifies archive integrity. Tests and compiled-CLI smoke checks passed on Linux/macOS with Go 1.24.7 and stable before these binaries were built. Feedback and issue reports welcome; this is not production qualification."
+          gh release edit "$RELEASE_TAG" --draft=false
